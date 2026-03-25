@@ -1,6 +1,5 @@
 import fetch, { Response } from 'node-fetch';
 import FormData from 'form-data';
-import * as stream from 'stream';
 import { lookup as lookupMimeType } from 'mime-types';
 import { OverleafCredentials } from './types';
 
@@ -107,14 +106,18 @@ export class OverleafAPI {
   ): Promise<FileEntity> {
     const identity = await this.ensureIdentity();
 
-    const fileStream = stream.Readable.from(content);
+    const fileBuffer = Buffer.from(content);
     const formData = new FormData();
-    const mimeType = lookupMimeType(filename) || 'text/plain';
+    const mimeType = lookupMimeType(filename) || 'application/octet-stream';
 
     formData.append('targetFolderId', parentFolderId);
     formData.append('name', filename);
     formData.append('type', mimeType);
-    formData.append('qqfile', fileStream, { filename });
+    formData.append('qqfile', fileBuffer, {
+      filename,
+      contentType: mimeType,
+      knownLength: fileBuffer.length,
+    });
 
     const response = await this.request(
       'POST',
