@@ -88,6 +88,62 @@ which ov
 }
 ```
 
+如果你是直接从 Overleaf 下载 zip 后在本地解压，没有现成的 `.overleaf/settings.json`，可以手动创建：
+
+```bash
+mkdir -p .overleaf
+ov uri "https://www.overleaf.com/project/<projectId>" "my-paper" --user-id <userId>
+```
+
+然后把输出内容保存到 `.overleaf/settings.json`。
+
+获取参数的方法：
+
+- `projectId`：项目 URL 中 `/project/` 后面的那串 ID。
+- `userId`：在浏览器打开 Overleaf 项目页，按 F12，在 Console 中执行：
+
+```js
+document.querySelector('meta[name="ol-user_id"]')?.content
+```
+
+如果 `window.user_id` 返回 `undefined`，优先使用上面的 `meta[name="ol-user_id"]` 方式。
+
+## 自定义同步范围（只同步部分文件）
+
+默认会尝试读取项目下的可选文件：
+
+- `.overleaf/sync-rules.json`
+
+你也可以在 `.overleaf/settings.json` 中指定自定义路径：
+
+```json
+{
+  "sync-rules-file": ".overleaf/sync-rules.json"
+}
+```
+
+规则文件格式：
+
+```json
+{
+  "include": [
+    "main.tex",
+    "section/**/*.tex",
+    "figures/**/*.pdf"
+  ],
+  "exclude": [
+    "section/draft/**",
+    "**/*.tmp"
+  ]
+}
+```
+
+规则说明：
+
+- `include` 非空时：只同步匹配到 `include` 的文件。
+- `exclude`：在 `include` 结果上再排除。
+- 仍会叠加 `ignore-patterns`（编译产物等会继续忽略）。
+
 ## 登录与凭据
 
 首次登录（或 cookie 过期后重新登录）：
