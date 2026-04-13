@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import * as path from 'path';
+import { spawn } from 'child_process';
 import { loadConfig, getLocalPath } from './config';
 import { Syncer } from './syncer';
-import { SyncOptions, OverleafCredentials } from './types';
+import {
+  ConflictResolutionResult,
+  SyncConflict,
+  SyncOptions,
+  OverleafCredentials,
+} from './types';
 import { extractProjectInfo } from './uri-parser';
 import { loadVsCodeCredentials, saveCredentials } from './credentials';
 
@@ -18,6 +23,10 @@ program
   .command('sync')
   .description('Sync local and remote Overleaf project')
   .option('-c, --config <path>', 'Path to .overleaf/settings.json')
+  .option(
+    '--merge-editor <editor>',
+    'Handle text conflicts in a merge editor (supported: vscode)'
+  )
   .option('-v, --verbose', 'Show detailed sync progress')
   .action(async (options) => {
     try {
@@ -48,11 +57,65 @@ program
         console.log(`⚠️  Failed to load credentials: ${error}\n`);
       }
 
+      let mergeEditor: 'vscode' | undefined;
+      if (options.mergeEditor) {
+        if (options.mergeEditor !== 'vscode') {
+          throw new Error(
+            `Unsupported merge editor "${options.mergeEditor}". Supported values: vscode`
+          );
+        }
+        mergeEditor = 'vscode';
+      }
+
+      let progressInterval: NodeJS.Timeout | undefined;
+      const stopProgressIndicator = () => {
+        if (!progressInterval) {
+          return;
+        }
+        clearInterval(progressInterval);
+        progressInterval = undefined;
+        process.stdout.write('\r\x1b[K');
+      };
+
+      const startProgressIndicator = () => {
+        if (options.verbose || progressInterval) {
+          return;
+        }
+        process.stdout.write('Syncing...');
+        const dots = ['.', '..', '...'];
+        let dotIndex = 0;
+        progressInterval = setInterval(() => {
+          process.stdout.write(`\rSyncing${dots[dotIndex % dots.length]}`);
+          dotIndex++;
+        }, 500);
+      };
+
+      let codeAvailable = false;
+      if (mergeEditor === 'vscode') {
+        codeAvailable = await isCommandAvailable('code', ['--version']);
+        if (!codeAvailable) {
+          console.log('⚠️  VS Code CLI "code" was not found in PATH.');
+          console.log('   Conflicts will still be written to .overleaf/conflicts/');
+          console.log('   Install it from VS Code: Command Palette -> "Shell Command: Install \'code\' command in PATH"\n');
+        }
+      }
+
       // Setup logging
       const syncOptions: SyncOptions = {
         localPath,
         settings: config,
         credentials,
+        mergeEditor,
+        conflictResolver: mergeEditor
+          ? async (conflict: SyncConflict): Promise<ConflictResolutionResult> => {
+              stopProgressIndicator();
+              return await resolveVSCodeConflict(conflict, codeAvailable, () => {
+                if (!options.verbose) {
+                  startProgressIndicator();
+                }
+              });
+            }
+          : undefined,
         onLog: (message: string) => {
           if (options.verbose) {
             console.log(`[${new Date().toLocaleTimeString()}] ${message}`);
@@ -67,17 +130,10 @@ program
 
       // Show progress indicator if not verbose
       if (!options.verbose) {
-        process.stdout.write('Syncing...');
-        const dots = ['.', '..', '...'];
-        let dotIndex = 0;
-        const interval = setInterval(() => {
-          process.stdout.write(`\rSyncing${dots[dotIndex % dots.length]}`);
-          dotIndex++;
-        }, 500);
-
-        process.on('exit', () => clearInterval(interval));
+        startProgressIndicator();
+        process.on('exit', () => stopProgressIndicator());
         process.on('SIGINT', () => {
-          clearInterval(interval);
+          stopProgressIndicator();
           process.exit();
         });
       }
@@ -88,7 +144,7 @@ program
 
       // Show results
       if (!options.verbose) {
-        process.stdout.write('\r\x1b[K'); // Clear line
+        stopProgressIndicator();
       }
 
       if (result.success) {
@@ -101,8 +157,17 @@ program
         if (result.filesDownloaded > 0) {
           console.log(`   Files downloaded: ${result.filesDownloaded}`);
         }
+        if (result.conflictsResolved > 0) {
+          console.log(`   Conflicts resolved: ${result.conflictsResolved}`);
+        }
       } else {
         console.error(`\n❌ Sync completed with errors:`);
+        if (result.conflictsResolved > 0) {
+          console.error(`   Conflicts resolved: ${result.conflictsResolved}`);
+        }
+        if (result.conflictsUnresolved > 0) {
+          console.error(`   Conflicts unresolved: ${result.conflictsUnresolved}`);
+        }
         result.errors.forEach((error) => console.error(`  - ${error}`));
         process.exit(1);
       }
@@ -219,6 +284,11 @@ program
       if (config['ignore-patterns']) {
         console.log(`  Ignore patterns: ${config['ignore-patterns'].length} patterns`);
       }
+      if (config['sync-rules-file']) {
+        console.log(`  Sync rules file: ${config['sync-rules-file']}`);
+      } else {
+        console.log('  Sync rules file: .overleaf/sync-rules.json (optional)');
+      }
     } catch (error) {
       console.error(`Error: ${error}`);
       process.exit(1);
@@ -226,3 +296,97 @@ program
   });
 
 program.parse();
+
+async function isCommandAvailable(
+  command: string,
+  args: string[] = []
+): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const child = spawn(command, args, {
+      stdio: 'ignore',
+    });
+
+    child.on('error', () => resolve(false));
+    child.on('exit', (code) => resolve(code === 0));
+  });
+}
+
+async function resolveVSCodeConflict(
+  conflict: SyncConflict,
+  codeAvailable: boolean,
+  onFinish: () => void
+): Promise<ConflictResolutionResult> {
+  console.log(`\n⚠️  Conflict detected: ${conflict.relPath}`);
+  console.log(`   Conflict files: ${conflict.artifactsDir}`);
+
+  if (!conflict.isText) {
+    onFinish();
+    return {
+      resolved: false,
+      message: `Conflict detected for ${conflict.relPath}: file is not valid UTF-8 text. Conflict artifacts written to ${conflict.artifactsDir}`,
+    };
+  }
+
+  if (!conflict.hasBase) {
+    console.log('   Base content is unavailable; using an empty base file.');
+  }
+
+  if (!codeAvailable) {
+    console.log('   VS Code CLI is unavailable, so the merge editor was not opened.');
+    console.log('   Open the files manually in VS Code after installing the "code" command.\n');
+    onFinish();
+    return {
+      resolved: false,
+      message: `Conflict detected for ${conflict.relPath}: VS Code CLI "code" was not found. Conflict artifacts written to ${conflict.artifactsDir}`,
+    };
+  }
+
+  console.log('   Opening VS Code Merge Editor...');
+  console.log(`   Result file: ${conflict.localPath}\n`);
+
+  try {
+    const exitCode = await runCommand('code', [
+      '--wait',
+      '--merge',
+      conflict.incomingPath,
+      conflict.currentPath,
+      conflict.basePath,
+      conflict.localPath,
+    ]);
+
+    onFinish();
+
+    if (exitCode !== 0) {
+      return {
+        resolved: false,
+        message: `Conflict detected for ${conflict.relPath}: VS Code Merge Editor exited with code ${exitCode}. Conflict artifacts written to ${conflict.artifactsDir}`,
+      };
+    }
+
+    return { resolved: true };
+  } catch (error) {
+    onFinish();
+    return {
+      resolved: false,
+      message: `Conflict detected for ${conflict.relPath}: failed to open VS Code Merge Editor (${error}). Conflict artifacts written to ${conflict.artifactsDir}`,
+    };
+  }
+}
+
+async function runCommand(command: string, args: string[]): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: 'inherit',
+    });
+
+    child.on('error', reject);
+    child.on('exit', (code, signal) => {
+      if (signal) {
+        reject(new Error(`terminated by signal ${signal}`));
+        return;
+      }
+
+      resolve(code ?? 0);
+    });
+  });
+}

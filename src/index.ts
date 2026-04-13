@@ -16,6 +16,8 @@ export {
   SyncSettings,
   SyncOptions,
   SyncResult,
+  SyncConflict,
+  ConflictResolutionResult,
   OverleafCredentials,
   ParsedURI,
   RemoteFile,

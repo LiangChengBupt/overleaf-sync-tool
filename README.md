@@ -9,6 +9,7 @@ GitHub: https://github.com/LiangChengBupt/overleaf-sync-tool
 - 手动同步：`ov sync`（不会后台自动频繁同步）
 - 双向同步：本地 <-> 远端（上传/下载/删除）
 - 文本冲突自动合并（可合并时）
+- 可选用 VS Code Merge Editor 处理文本冲突
 - 复用 Overleaf Workshop 的项目配置文件：`.overleaf/settings.json`
 
 ## 安装方式
@@ -108,7 +109,7 @@ document.querySelector('meta[name="ol-user_id"]')?.content
 
 如果 `window.user_id` 返回 `undefined`，优先使用上面的 `meta[name="ol-user_id"]` 方式。
 
-## 自定义同步范围（只同步部分文件）
+## 自定义同步范围
 
 默认会尝试读取项目下的可选文件：
 
@@ -130,18 +131,13 @@ document.querySelector('meta[name="ol-user_id"]')?.content
     "main.tex",
     "section/**/*.tex",
     "figures/**/*.pdf"
-  ],
-  "exclude": [
-    "section/draft/**",
-    "**/*.tmp"
   ]
 }
 ```
 
 规则说明：
 
-- `include` 非空时：只同步匹配到 `include` 的文件。
-- `exclude`：在 `include` 结果上再排除。
+- `include` 非空时：只同步匹配到这些规则的文件。
 - 仍会叠加 `ignore-patterns`（编译产物等会继续忽略）。
 
 ## 登录与凭据
@@ -173,6 +169,9 @@ ov sync
 # 详细日志
 ov sync --verbose
 
+# 用 VS Code Merge Editor 处理文本冲突
+ov sync --merge-editor vscode
+
 # 指定配置文件
 ov sync --config /path/to/.overleaf/settings.json
 ```
@@ -183,6 +182,19 @@ ov sync --config /path/to/.overleaf/settings.json
 cd "/path/to/your/project"
 ov sync --verbose
 ```
+
+如果你希望本地和远端都改动时进入 VS Code Merge Editor：
+
+```bash
+ov sync --merge-editor vscode --verbose
+```
+
+说明：
+
+- 只有在传入 `--merge-editor vscode` 时，双方都修改的文本文件才会进入 Merge Editor。
+- 冲突材料会写到 `.overleaf/conflicts/<timestamp>/`。
+- 在 VS Code Merge Editor 中处理完冲突后，需要手动保存并关闭该 Merge Editor 标签页；当前这次 `ov sync` 才会继续上传合并结果。
+- 如果系统里没有 `code` 命令，工具仍会写出冲突材料，但不会自动打开 VS Code。
 
 ## 常见问题
 
@@ -199,6 +211,10 @@ ov sync --verbose
 
 - 看到 `(DEP0044) util.isArray is deprecated`
   - 这是旧版 socket.io-client 的弃用警告，通常不影响同步。
+
+- `--merge-editor vscode` 没有自动打开 VS Code
+  - 先在 VS Code Command Palette 执行：
+    `Shell Command: Install 'code' command in PATH`
 
 ## 与 Overleaf Workshop 的关系
 

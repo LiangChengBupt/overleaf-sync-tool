@@ -9,6 +9,7 @@ export interface SyncSettings {
   projectName: string;
   enableCompileNPreview?: boolean;
   'ignore-patterns'?: string[];
+  'sync-rules-file'?: string;
 }
 
 export interface ParsedURI {
@@ -29,6 +30,10 @@ export interface SyncOptions {
   localPath: string;
   settings: SyncSettings;
   credentials?: OverleafCredentials;
+  mergeEditor?: 'vscode';
+  conflictResolver?: (
+    conflict: SyncConflict
+  ) => Promise<ConflictResolutionResult>;
   onProgress?: (file: string, current: number, total: number) => void;
   onLog?: (message: string) => void;
 }
@@ -38,7 +43,25 @@ export interface SyncResult {
   filesSynced: number;
   filesUploaded: number;
   filesDownloaded: number;
+  conflictsResolved: number;
+  conflictsUnresolved: number;
   errors: string[];
+}
+
+export interface SyncConflict {
+  relPath: string;
+  localPath: string;
+  incomingPath: string;
+  currentPath: string;
+  basePath: string;
+  artifactsDir: string;
+  hasBase: boolean;
+  isText: boolean;
+}
+
+export interface ConflictResolutionResult {
+  resolved: boolean;
+  message?: string;
 }
 
 export interface RemoteFile {

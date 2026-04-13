@@ -1,6 +1,10 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { SyncOptions, SyncResult } from './types';
+import {
+  SyncConflict,
+  SyncOptions,
+  SyncResult,
+} from './types';
 import { hashCode, matchIgnorePatterns, mergeContent } from './utils';
 import {
   OverleafAPI,
@@ -48,6 +52,7 @@ const DOC_EXTENSIONS = new Set([
 
 const CACHE_VERSION = 1;
 const MAX_CACHE_CONTENT_BYTES = 2 * 1024 * 1024;
+const DEFAULT_SYNC_RULES_FILE = '.overleaf/sync-rules.json';
 
 interface SyncCacheEntry {
   hash: number;
@@ -74,12 +79,30 @@ interface RemoteState {
 interface SyncDelta {
   uploaded: boolean;
   downloaded: boolean;
+  conflictResolved: boolean;
+}
+
+interface CustomSyncRulesFile {
+  include?: string[];
+}
+
+class UnresolvedConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly conflict: SyncConflict
+  ) {
+    super(message);
+  }
 }
 
 export class Syncer {
   private readonly ignorePatterns: string[];
   private readonly api?: OverleafAPI;
   private readonly cachePath: string;
+  private readonly conflictsRootPath: string;
+  private includePatterns: string[] = [];
+  private rulesFilePath?: string;
+  private conflictSessionDir?: string;
 
   constructor(private readonly options: SyncOptions) {
     this.ignorePatterns =
@@ -88,6 +111,11 @@ export class Syncer {
       this.options.localPath,
       '.overleaf',
       'ov-sync-cache.json'
+    );
+    this.conflictsRootPath = path.join(
+      this.options.localPath,
+      '.overleaf',
+      'conflicts'
     );
 
     if (options.credentials) {
@@ -101,6 +129,8 @@ export class Syncer {
       filesSynced: 0,
       filesUploaded: 0,
       filesDownloaded: 0,
+      conflictsResolved: 0,
+      conflictsUnresolved: 0,
       errors: [],
     };
 
@@ -108,6 +138,8 @@ export class Syncer {
       this.log('Starting sync...');
       this.log(`Local path: ${this.options.localPath}`);
       this.log(`Project: ${this.options.settings.projectName}`);
+      await this.loadCustomSyncRules();
+      this.logActiveSyncRules();
 
       const localFiles = new Set(await this.collectFiles('/'));
       this.log(`Found ${localFiles.size} local files`);
@@ -130,13 +162,17 @@ export class Syncer {
       this.log('Authentication successful');
 
       const cache = await this.loadCache();
+      this.pruneCacheByRules(cache);
       const remoteState = await this.loadRemoteState();
       const remoteContentCache = new Map<string, Uint8Array>();
 
+      const cachePaths = Object.keys(cache.files).filter((relPath) =>
+        this.shouldSyncPath(relPath)
+      );
       const allPaths = new Set<string>([
         ...localFiles,
         ...remoteState.files.keys(),
-        ...Object.keys(cache.files),
+        ...cachePaths,
       ]);
       const orderedPaths = [...allPaths].sort((a, b) => a.localeCompare(b));
 
@@ -164,7 +200,13 @@ export class Syncer {
           if (delta.downloaded) {
             result.filesDownloaded++;
           }
+          if (delta.conflictResolved) {
+            result.conflictsResolved++;
+          }
         } catch (error) {
+          if (error instanceof UnresolvedConflictError) {
+            result.conflictsUnresolved++;
+          }
           const errorMsg = `Failed to sync ${relPath}: ${error}`;
           result.errors.push(errorMsg);
           this.log(errorMsg);
@@ -197,7 +239,11 @@ export class Syncer {
     remoteContentCache: Map<string, Uint8Array>,
     cache: SyncCache
   ): Promise<SyncDelta> {
-    const delta: SyncDelta = { uploaded: false, downloaded: false };
+    const delta: SyncDelta = {
+      uploaded: false,
+      downloaded: false,
+      conflictResolved: false,
+    };
 
     let localExists = localFiles.has(relPath);
     let localContent: Uint8Array | undefined;
@@ -299,6 +345,7 @@ export class Syncer {
     const baseContent = this.getBaseContent(cache, relPath);
     if (
       baseContent &&
+      !this.options.mergeEditor &&
       this.isTextContent(baseContent) &&
       this.isTextContent(localContent!) &&
       this.isTextContent(remoteContent!)
@@ -315,6 +362,23 @@ export class Syncer {
       delta.uploaded = true;
       delta.downloaded = true;
       this.log(`  Merged: ${relPath}`);
+      return delta;
+    }
+
+    if (this.options.mergeEditor === 'vscode') {
+      const resolvedContent = await this.resolveConflictWithEditor(
+        relPath,
+        localContent!,
+        remoteContent!,
+        baseContent,
+        remoteState,
+        remoteContentCache
+      );
+      this.updateCacheEntry(cache, relPath, resolvedContent);
+      delta.uploaded = true;
+      delta.downloaded = true;
+      delta.conflictResolved = true;
+      this.log(`  Resolved in merge editor: ${relPath}`);
       return delta;
     }
 
@@ -339,13 +403,15 @@ export class Syncer {
             path.join(currentRoot, entry.name)
           );
 
-          if (this.matchIgnorePatterns(relPath)) {
-            continue;
-          }
-
           if (entry.isDirectory()) {
+            if (!this.shouldTraverseDirectory(relPath)) {
+              continue;
+            }
             queue.push(relPath);
           } else if (entry.isFile()) {
+            if (!this.shouldSyncPath(relPath)) {
+              continue;
+            }
             files.push(relPath);
           }
         }
@@ -359,6 +425,124 @@ export class Syncer {
 
   private matchIgnorePatterns(relPath: string): boolean {
     return matchIgnorePatterns(relPath, this.ignorePatterns);
+  }
+
+  private shouldSyncPath(relPath: string): boolean {
+    if (this.matchIgnorePatterns(relPath)) {
+      return false;
+    }
+
+    if (
+      this.includePatterns.length > 0 &&
+      !this.matchPatterns(relPath, this.includePatterns)
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private shouldTraverseDirectory(relPath: string): boolean {
+    if (this.matchIgnorePatterns(relPath)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private matchPatterns(relPath: string, patterns: string[]): boolean {
+    const noLeadingSlash = relPath.startsWith('/')
+      ? relPath.slice(1)
+      : relPath;
+
+    return (
+      matchIgnorePatterns(relPath, patterns) ||
+      matchIgnorePatterns(noLeadingSlash, patterns)
+    );
+  }
+
+  private resolveRulesFilePath(): string {
+    const customRulesFile = this.options.settings['sync-rules-file'];
+    const relPath = customRulesFile && customRulesFile.trim().length > 0
+      ? customRulesFile.trim()
+      : DEFAULT_SYNC_RULES_FILE;
+
+    if (path.isAbsolute(relPath)) {
+      return relPath;
+    }
+
+    return path.join(this.options.localPath, relPath);
+  }
+
+  private async loadCustomSyncRules(): Promise<void> {
+    this.includePatterns = [];
+    this.rulesFilePath = undefined;
+
+    const rulesPath = this.resolveRulesFilePath();
+
+    try {
+      const content = await fs.readFile(rulesPath, 'utf-8');
+      const parsed = JSON.parse(content) as CustomSyncRulesFile;
+
+      this.includePatterns = this.toPatternList(parsed.include);
+      this.rulesFilePath = rulesPath;
+    } catch (error) {
+      // rules file is optional when using default path
+      if (
+        this.options.settings['sync-rules-file'] &&
+        (error as NodeJS.ErrnoException)?.code === 'ENOENT'
+      ) {
+        throw new Error(
+          `sync-rules-file not found: ${rulesPath}`
+        );
+      }
+      if (
+        (error as NodeJS.ErrnoException)?.code !== 'ENOENT' &&
+        this.options.settings['sync-rules-file']
+      ) {
+        throw new Error(
+          `Failed to parse sync rules file ${rulesPath}: ${error}`
+        );
+      }
+      if (
+        (error as NodeJS.ErrnoException)?.code !== 'ENOENT' &&
+        !this.options.settings['sync-rules-file']
+      ) {
+        throw new Error(
+          `Failed to parse default sync rules file ${rulesPath}: ${error}`
+        );
+      }
+    }
+  }
+
+  private toPatternList(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+
+  private logActiveSyncRules() {
+    if (!this.rulesFilePath) {
+      return;
+    }
+
+    this.log(`Using sync rules: ${this.rulesFilePath}`);
+    if (this.includePatterns.length > 0) {
+      this.log(`  include patterns: ${this.includePatterns.length}`);
+    }
+  }
+
+  private pruneCacheByRules(cache: SyncCache) {
+    for (const relPath of Object.keys(cache.files)) {
+      if (!this.shouldSyncPath(relPath)) {
+        delete cache.files[relPath];
+      }
+    }
   }
 
   private normalizeRelPath(relPath: string): string {
@@ -455,6 +639,9 @@ export class Syncer {
     const docs = folder.docs || [];
     for (const doc of docs) {
       const relPath = this.joinRemotePath(folderPath, doc.name);
+      if (!this.shouldSyncPath(relPath)) {
+        continue;
+      }
       remoteState.files.set(relPath, {
         _id: doc._id,
         _type: 'doc',
@@ -466,6 +653,9 @@ export class Syncer {
     const fileRefs = folder.fileRefs || [];
     for (const fileRef of fileRefs) {
       const relPath = this.joinRemotePath(folderPath, fileRef.name);
+      if (!this.shouldSyncPath(relPath)) {
+        continue;
+      }
       remoteState.files.set(relPath, {
         _id: fileRef._id,
         _type: 'file',
@@ -611,6 +801,132 @@ export class Syncer {
 
   private deleteCacheEntry(cache: SyncCache, relPath: string) {
     delete cache.files[relPath];
+  }
+
+  private async resolveConflictWithEditor(
+    relPath: string,
+    localContent: Uint8Array,
+    remoteContent: Uint8Array,
+    baseContent: Uint8Array | undefined,
+    remoteState: RemoteState,
+    remoteContentCache: Map<string, Uint8Array>
+  ): Promise<Uint8Array> {
+    const conflict = await this.prepareConflictArtifacts(
+      relPath,
+      localContent,
+      remoteContent,
+      baseContent
+    );
+
+    if (!conflict.isText) {
+      throw new UnresolvedConflictError(
+        `Conflict detected for ${relPath}: file is not valid UTF-8 text. Conflict artifacts written to ${conflict.artifactsDir}`,
+        conflict
+      );
+    }
+
+    if (!this.options.conflictResolver) {
+      throw new UnresolvedConflictError(
+        `Conflict detected for ${relPath}: no conflict resolver is configured. Conflict artifacts written to ${conflict.artifactsDir}`,
+        conflict
+      );
+    }
+
+    if (!conflict.hasBase) {
+      this.log(`  Conflict base missing for ${relPath}; using empty base file`);
+    }
+
+    const resolution = await this.options.conflictResolver(conflict);
+    if (!resolution.resolved) {
+      throw new UnresolvedConflictError(
+        resolution.message ||
+          `Conflict detected for ${relPath}. Conflict artifacts written to ${conflict.artifactsDir}`,
+        conflict
+      );
+    }
+
+    const resolvedContent = await this.readAbsoluteFile(conflict.localPath);
+    if (!resolvedContent) {
+      throw new UnresolvedConflictError(
+        `Conflict detected for ${relPath}: merged result file is missing or unreadable at ${conflict.localPath}. Conflict artifacts written to ${conflict.artifactsDir}`,
+        conflict
+      );
+    }
+
+    await this.uploadLocalToRemote(
+      relPath,
+      resolvedContent,
+      remoteState,
+      remoteContentCache
+    );
+
+    return resolvedContent;
+  }
+
+  private async prepareConflictArtifacts(
+    relPath: string,
+    localContent: Uint8Array,
+    remoteContent: Uint8Array,
+    baseContent: Uint8Array | undefined
+  ): Promise<SyncConflict> {
+    const sessionDir = await this.getConflictSessionDir();
+    const normalizedRelPath = relPath.startsWith('/')
+      ? relPath.slice(1)
+      : relPath;
+    const incomingPath = path.join(sessionDir, 'incoming', normalizedRelPath);
+    const currentPath = path.join(sessionDir, 'current', normalizedRelPath);
+    const basePath = path.join(sessionDir, 'base', normalizedRelPath);
+    const localPath = path.join(this.options.localPath, normalizedRelPath);
+    const emptyBase = new Uint8Array();
+
+    await this.writeAbsoluteFile(incomingPath, remoteContent);
+    await this.writeAbsoluteFile(currentPath, localContent);
+    await this.writeAbsoluteFile(basePath, baseContent || emptyBase);
+
+    return {
+      relPath,
+      localPath,
+      incomingPath,
+      currentPath,
+      basePath,
+      artifactsDir: sessionDir,
+      hasBase: baseContent !== undefined,
+      isText:
+        this.isTextContent(localContent) &&
+        this.isTextContent(remoteContent) &&
+        (baseContent === undefined || this.isTextContent(baseContent)),
+    };
+  }
+
+  private async getConflictSessionDir(): Promise<string> {
+    if (this.conflictSessionDir) {
+      return this.conflictSessionDir;
+    }
+
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, '')
+      .replace(/\.\d{3}Z$/, 'Z');
+    this.conflictSessionDir = path.join(this.conflictsRootPath, timestamp);
+    await fs.mkdir(this.conflictSessionDir, { recursive: true });
+    return this.conflictSessionDir;
+  }
+
+  private async writeAbsoluteFile(
+    targetPath: string,
+    content: Uint8Array
+  ): Promise<void> {
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.writeFile(targetPath, content);
+  }
+
+  private async readAbsoluteFile(filePath: string): Promise<Uint8Array | undefined> {
+    try {
+      const buffer = await fs.readFile(filePath);
+      return new Uint8Array(buffer);
+    } catch {
+      return undefined;
+    }
   }
 
   private shouldCreateDoc(relPath: string, content: Uint8Array): boolean {
